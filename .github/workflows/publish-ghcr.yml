@@ -1,0 +1,172 @@
+name: Build and publish GHCR image
+
+on:
+  workflow_call:
+    inputs:
+      context:
+        description: Docker build context
+        required: false
+        type: string
+        default: .
+      dockerfile:
+        description: Dockerfile path relative to the repository root
+        required: false
+        type: string
+        default: ./.docker/prod/Dockerfile
+      image_suffix:
+        description: Image name suffix and cache scope
+        required: false
+        type: string
+        default: app
+    secrets:
+      helper_webhook_url:
+        description: Helper Tool Docker publication webhook URL
+        required: true
+      helper_webhook_secret:
+        description: Helper Tool Docker publication webhook secret
+        required: true
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: publish-docker-${{ github.ref }}-${{ inputs.image_suffix }}
+  cancel-in-progress: true
+
+env:
+  CACHE_TAG: buildcache
+  REGISTRY: ghcr.io
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Determine publication and cache settings
+        id: settings
+        env:
+          CALLER_REPOSITORY: ${{ github.repository }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          EVENT_NAME: ${{ github.event_name }}
+          IMAGE_SUFFIX: ${{ inputs.image_suffix }}
+          PR_DRAFT: ${{ github.event.pull_request.draft }}
+          PR_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          if [[ ! "$IMAGE_SUFFIX" =~ ^[a-z0-9]+([._-][a-z0-9]+)*$ ]]; then
+              echo "Invalid image suffix: $IMAGE_SUFFIX" >&2
+              exit 1
+          fi
+
+          image="$REGISTRY/${CALLER_REPOSITORY,,}-$IMAGE_SUFFIX"
+          should_push=true
+          can_use_registry_cache=true
+
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+              if [ "$PR_HEAD_REPOSITORY" != "$CALLER_REPOSITORY" ]; then
+                  can_use_registry_cache=false
+                  should_push=false
+              elif [ "$PR_DRAFT" = "true" ]; then
+                  should_push=false
+              fi
+          fi
+
+          {
+              echo "image=$image"
+              echo "should_push=$should_push"
+              echo "can_use_registry_cache=$can_use_registry_cache"
+              echo 'cache_from<<EOF'
+              echo "type=gha,scope=$IMAGE_SUFFIX,version=2"
+              if [ "$can_use_registry_cache" = "true" ]; then
+                  echo "type=registry,ref=$image:$CACHE_TAG"
+              fi
+              echo 'EOF'
+              echo 'cache_to<<EOF'
+              echo "type=gha,scope=$IMAGE_SUFFIX,mode=max,version=2,ignore-error=true"
+              if [ "$should_push" = "true" ] && [ "$REF_NAME" = "$DEFAULT_BRANCH" ]; then
+                  echo "type=registry,ref=$image:$CACHE_TAG,mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true"
+              fi
+              echo 'EOF'
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Validate Helper Tool webhook secrets
+        if: steps.settings.outputs.should_push == 'true'
+        env:
+          HELPER_WEBHOOK_SECRET: ${{ secrets.helper_webhook_secret }}
+          HELPER_WEBHOOK_URL: ${{ secrets.helper_webhook_url }}
+        run: |
+          if [ -z "$HELPER_WEBHOOK_URL" ] || [ -z "$HELPER_WEBHOOK_SECRET" ]; then
+              echo "Configure both helper_webhook_url and helper_webhook_secret." >&2
+              exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        if: steps.settings.outputs.can_use_registry_cache == 'true'
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate Docker metadata
+        id: metadata
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ steps.settings.outputs.image }}
+          tags: |
+            type=ref,event=branch
+            type=raw,value=${{ github.head_ref }},enable=${{ github.event_name == 'pull_request' }}
+            type=sha
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push image
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          platforms: linux/amd64
+          push: ${{ steps.settings.outputs.should_push }}
+          tags: ${{ steps.metadata.outputs.tags }}
+          labels: ${{ steps.metadata.outputs.labels }}
+          cache-from: ${{ steps.settings.outputs.cache_from }}
+          cache-to: ${{ steps.settings.outputs.cache_to }}
+
+      - name: Notify Helper Tool
+        if: steps.settings.outputs.should_push == 'true'
+        env:
+          DELIVERY_ID: ${{ github.run_id }}:${{ github.run_attempt }}:${{ inputs.image_suffix }}
+          HELPER_WEBHOOK_SECRET: ${{ secrets.helper_webhook_secret }}
+          HELPER_WEBHOOK_URL: ${{ secrets.helper_webhook_url }}
+          IMAGE: ${{ steps.settings.outputs.image }}
+          IMAGE_METADATA: ${{ steps.metadata.outputs.json }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          image = os.environ["IMAGE"]
+          prefix = image + ":"
+          metadata = json.loads(os.environ["IMAGE_METADATA"])
+          tags = [tag[len(prefix):] for tag in metadata["tags"] if tag.startswith(prefix)]
+          if not tags:
+              raise SystemExit("No published tags found for the image.")
+          payload = {"image": image, "tags": tags}
+          Path(os.environ["RUNNER_TEMP"], "helper-publication.json").write_text(json.dumps(payload))
+          PY
+          curl --fail-with-body --silent --show-error \
+              --proto '=https' --connect-timeout 10 --max-time 30 \
+              --retry 3 --retry-delay 5 --retry-connrefused \
+              -H "Authorization: Bearer $HELPER_WEBHOOK_SECRET" \
+              -H 'Content-Type: application/json' \
+              -H "X-Webhook-Delivery: $DELIVERY_ID" \
+              --data-binary "@$RUNNER_TEMP/helper-publication.json" \
+              "$HELPER_WEBHOOK_URL"
