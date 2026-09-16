@@ -18,7 +18,28 @@ on:
         required: false
         type: string
         default: app
+      checkout_submodules:
+        description: Whether to check out Git submodules recursively
+        required: false
+        type: boolean
+        default: false
+      checkout_app_id:
+        description: GitHub App ID used to create a checkout token
+        required: false
+        type: string
+        default: ""
+      checkout_app_repositories:
+        description: Comma or newline-separated repositories accessible to the checkout token
+        required: false
+        type: string
+        default: ""
     secrets:
+      checkout_token:
+        description: Optional token for checking out private submodules
+        required: false
+      checkout_app_private_key:
+        description: Private key for the GitHub App used to create a checkout token
+        required: false
       helper_webhook_url:
         description: Helper Tool Docker publication webhook URL
         required: true
@@ -101,8 +122,22 @@ jobs:
               exit 1
           fi
 
+      - name: Create GitHub App checkout token
+        id: checkout-app-token
+        if: inputs.checkout_submodules && inputs.checkout_app_id != ''
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ inputs.checkout_app_id }}
+          private-key: ${{ secrets.checkout_app_private_key }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ inputs.checkout_app_repositories }}
+          permission-contents: read
+
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          submodules: ${{ inputs.checkout_submodules && 'recursive' || 'false' }}
+          token: ${{ steps.checkout-app-token.outputs.token || secrets.checkout_token || github.token }}
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v4

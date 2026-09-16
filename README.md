@@ -28,3 +28,73 @@ jobs:
 The workflow publishes branch, commit SHA and default-branch `latest` tags. A
 non-draft pull request from the same repository also publishes its sanitized
 head-branch tag. Draft pull requests build without publishing.
+
+### Private submodules
+
+Submodule checkout is disabled by default. Callers can enable recursive
+checkout and either pass a token directly or let the workflow create a
+short-lived GitHub App token.
+
+For a GitHub App, install the app on every repository involved in the checkout
+and grant it read-only repository contents access:
+
+```yaml
+jobs:
+  publish:
+    uses: ITZ-Rhein-Maas-GmbH/ci-workflows/.github/workflows/publish-ghcr.yml@main
+    with:
+      checkout_submodules: true
+      checkout_app_id: ${{ vars.CHECKOUT_APP_ID }}
+      checkout_app_repositories: |
+        application-repository
+        private-submodule-repository
+    secrets:
+      checkout_app_private_key: ${{ secrets.CHECKOUT_APP_PRIVATE_KEY }}
+      helper_webhook_url: ${{ secrets.HELPER_WEBHOOK_URL }}
+      helper_webhook_secret: ${{ secrets.HELPER_WEBHOOK_SECRET }}
+```
+
+#### Set up the GitHub App
+
+Do not store an installation access token as an Actions secret. Installation
+tokens expire after one hour. This workflow creates a token for each job and
+revokes it when the job finishes.
+
+1. [Register a GitHub App](https://docs.github.com/en/apps/creating-github-apps/registering-a-github-app/registering-a-github-app)
+   under the organization that owns the caller and submodule repositories.
+2. Give the app `Read-only` access under **Repository permissions > Contents**.
+   Disable webhooks and restrict installation to the app owner's account unless
+   the app needs to be installed elsewhere.
+3. [Install the app](https://docs.github.com/en/apps/using-github-apps/installing-your-own-github-app)
+   on the caller repository and every private submodule repository. Prefer
+   **Only select repositories**.
+4. Copy the numeric App ID from the app settings page.
+5. Under **Private keys**, select **Generate a private key** and save the
+   downloaded PEM file securely. GitHub documents key generation and rotation
+   in [Managing private keys for GitHub Apps](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/managing-private-keys-for-github-apps).
+6. Add `CHECKOUT_APP_ID` as an Actions variable and the full PEM file as the
+   `CHECKOUT_APP_PRIVATE_KEY` Actions secret in the caller repository:
+
+   ```bash
+   gh variable set CHECKOUT_APP_ID \
+     --repo OWNER/CALLER_REPOSITORY \
+     --body 'NUMERIC_APP_ID'
+
+   gh secret set CHECKOUT_APP_PRIVATE_KEY \
+     --repo OWNER/CALLER_REPOSITORY \
+     < /path/to/github-app-private-key.pem
+   ```
+
+Organization-level variables and secrets also work when their repository
+access includes the caller. The caller passes the App ID and private key to the
+reusable workflow explicitly. The workflow uses
+[`actions/create-github-app-token`](https://github.com/actions/create-github-app-token)
+to generate the short-lived installation token.
+
+Publish changes to this shared workflow before publishing a caller that uses
+new inputs or secrets. For callers that reference `@main`, merge the
+`ci-workflows` change first.
+
+Alternatively, pass a PAT or another valid credential as the optional
+`checkout_token` secret. When no checkout credential is supplied, the workflow
+uses the caller repository's `GITHUB_TOKEN`.
