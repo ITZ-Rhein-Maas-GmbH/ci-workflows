@@ -29,6 +29,39 @@ The workflow publishes branch, commit SHA and default-branch `latest` tags. A
 non-draft pull request from the same repository also publishes its sanitized
 head-branch tag. Draft pull requests build without publishing.
 
+The build receives `APP_VERSION` containing the caller's Git commit SHA. A
+Dockerfile can declare `ARG APP_VERSION` and store it in an image environment
+variable for application release tracking.
+
+Set the optional `target` input to publish a named Dockerfile stage. Use a
+distinct `image_suffix` for each image so their tags and build caches stay separate.
+Omitting `target` builds the final stage.
+
+### Build caches
+
+Each image keeps its own GitHub Actions cache scope. Branch builds also export
+all intermediate stages to GHCR with `mode=max`. The default branch uses
+`:buildcache`; other branches use `:buildcache-branch-<first 16 SHA-256 hex characters of the full Git ref>`.
+Hashing the full ref avoids collisions between names such as `design/jero` and
+`design-jero`. Each branch imports its own registry cache and the default branch's
+cache. Keep these tags when applying package cleanup rules.
+
+The registry cache survives GitHub Actions' seven-day idle cache eviction.
+Different branches and images write separate cache tags, so parallel builds
+do not replace each other's cache manifests. Pull requests and tag builds do
+not write registry caches; fork pull requests do not access private registry
+caches. GitHub Actions' own branch access restrictions still apply to GHA caches.
+
+For images with shared Dockerfile stages, set `cache_from_image_suffixes` to
+additional suffixes, one per line. For example, an `app` build can import `cli`
+and a `cli` build can import `app`. This only adds cache reads; each build still
+writes its own cache. Missing caches on the first build are expected. Concurrent
+cold builds may both compile shared stages before either exports its cache.
+
+Changing a base image digest or a build instruction invalidates the dependent
+layers even when the cache is available. Floating base tags continue to pick up
+upstream updates; persistent caching does not prevent these rebuilds.
+
 ### Private submodules
 
 Submodule checkout is disabled by default. Callers can enable recursive

@@ -18,6 +18,16 @@ on:
         required: false
         type: string
         default: app
+      target:
+        description: Dockerfile build target, empty for the final stage
+        required: false
+        type: string
+        default: ""
+      cache_from_image_suffixes:
+        description: Additional image suffixes in this repository to import build caches from, one per line
+        required: false
+        type: string
+        default: ""
       checkout_submodules:
         description: Whether to check out Git submodules recursively
         required: false
@@ -68,12 +78,13 @@ jobs:
         id: settings
         env:
           CALLER_REPOSITORY: ${{ github.repository }}
+          CACHE_FROM_IMAGE_SUFFIXES: ${{ inputs.cache_from_image_suffixes }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           EVENT_NAME: ${{ github.event_name }}
           IMAGE_SUFFIX: ${{ inputs.image_suffix }}
           PR_DRAFT: ${{ github.event.pull_request.draft }}
           PR_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
-          REF_NAME: ${{ github.ref_name }}
+          REF: ${{ github.ref }}
         run: |
           if [[ ! "$IMAGE_SUFFIX" =~ ^[a-z0-9]+([._-][a-z0-9]+)*$ ]]; then
               echo "Invalid image suffix: $IMAGE_SUFFIX" >&2
@@ -93,20 +104,44 @@ jobs:
               fi
           fi
 
+          # Each branch writes its own registry cache. Keep the default branch's
+          # existing tag so other branches and older callers can still reuse it.
+          cache_tag="$CACHE_TAG"
+          if [[ "$REF" == refs/heads/* ]] && [ "$REF" != "refs/heads/$DEFAULT_BRANCH" ]; then
+              ref_hash=$(printf '%s' "$REF" | sha256sum)
+              cache_tag="$CACHE_TAG-branch-${ref_hash:0:16}"
+          fi
+
+          cache_sources=("$IMAGE_SUFFIX")
+          while IFS= read -r suffix; do
+              [ -z "$suffix" ] && continue
+              if [[ ! "$suffix" =~ ^[a-z0-9]+([._-][a-z0-9]+)*$ ]]; then
+                  echo "Invalid cache image suffix: $suffix" >&2
+                  exit 1
+              fi
+              [ "$suffix" = "$IMAGE_SUFFIX" ] || cache_sources+=("$suffix")
+          done <<<"$CACHE_FROM_IMAGE_SUFFIXES"
+
           {
               echo "image=$image"
               echo "should_push=$should_push"
               echo "can_use_registry_cache=$can_use_registry_cache"
               echo 'cache_from<<EOF'
-              echo "type=gha,scope=$IMAGE_SUFFIX,version=2"
-              if [ "$can_use_registry_cache" = "true" ]; then
-                  echo "type=registry,ref=$image:$CACHE_TAG"
-              fi
+              for suffix in "${cache_sources[@]}"; do
+                  echo "type=gha,scope=$suffix,version=2"
+                  if [ "$can_use_registry_cache" = "true" ]; then
+                      cache_image="$REGISTRY/${CALLER_REPOSITORY,,}-$suffix"
+                      echo "type=registry,ref=$cache_image:$cache_tag"
+                      if [ "$cache_tag" != "$CACHE_TAG" ]; then
+                          echo "type=registry,ref=$cache_image:$CACHE_TAG"
+                      fi
+                  fi
+              done
               echo 'EOF'
               echo 'cache_to<<EOF'
               echo "type=gha,scope=$IMAGE_SUFFIX,mode=max,version=2,ignore-error=true"
-              if [ "$should_push" = "true" ] && [ "$REF_NAME" = "$DEFAULT_BRANCH" ]; then
-                  echo "type=registry,ref=$image:$CACHE_TAG,mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true"
+              if [ "$should_push" = "true" ] && [[ "$REF" == refs/heads/* ]]; then
+                  echo "type=registry,ref=$image:$cache_tag,mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true"
               fi
               echo 'EOF'
           } >>"$GITHUB_OUTPUT"
@@ -167,10 +202,13 @@ jobs:
         with:
           context: ${{ inputs.context }}
           file: ${{ inputs.dockerfile }}
+          target: ${{ inputs.target }}
           platforms: linux/amd64
           push: ${{ steps.settings.outputs.should_push }}
           tags: ${{ steps.metadata.outputs.tags }}
           labels: ${{ steps.metadata.outputs.labels }}
+          build-args: |
+            APP_VERSION=${{ github.sha }}
           cache-from: ${{ steps.settings.outputs.cache_from }}
           cache-to: ${{ steps.settings.outputs.cache_to }}
 
