@@ -62,6 +62,19 @@ Changing a base image digest or a build instruction invalidates the dependent
 layers even when the cache is available. Floating base tags continue to pick up
 upstream updates; persistent caching does not prevent these rebuilds.
 
+Set `cache_mounts: true` to persist Dockerfile `RUN --mount=type=cache` mounts,
+such as npm downloads or Next.js compilation caches.
+This is disabled by default. The workflow discovers the mounts from the selected
+Dockerfile and restores them before building, then extracts and saves them after
+a successful build. Mount caches are separate from the GHA and registry layer
+caches. They use GitHub Actions storage and remain subject to its cache eviction
+and branch access rules.
+
+Each image and Dockerfile has a separate mount cache. Every successful run saves
+an updated snapshot so restored caches keep accumulating downloaded packages and
+compilation results. Cache files and temporary extraction files stay outside the
+build context.
+
 ### Private submodules
 
 Submodule checkout is disabled by default. Callers can enable recursive
