@@ -33,6 +33,10 @@ The build receives `APP_VERSION` containing the caller's Git commit SHA. A
 Dockerfile can declare `ARG APP_VERSION` and store it in an image environment
 variable for application release tracking.
 
+Pass further build arguments through the optional `build_args` input, one
+`KEY=value` per line (e.g. `build_args: ATLAS_MODULES=@kubicz`). `APP_VERSION`
+is always set by the workflow.
+
 Set the optional `target` input to publish a named Dockerfile stage. Use a
 distinct `image_suffix` for each image so their tags and build caches stay separate.
 Omitting `target` builds the final stage.

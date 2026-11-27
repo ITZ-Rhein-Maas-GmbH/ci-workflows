@@ -23,6 +23,11 @@ on:
         required: false
         type: string
         default: ""
+      build_args:
+        description: Additional Docker build arguments (KEY=value), one per line; APP_VERSION is always set
+        required: false
+        type: string
+        default: ""
       cache_from_image_suffixes:
         description: Additional image suffixes in this repository to import build caches from, one per line
         required: false
@@ -233,6 +238,7 @@ jobs:
           labels: ${{ steps.metadata.outputs.labels }}
           build-args: |
             APP_VERSION=${{ github.sha }}
+            ${{ inputs.build_args }}
           cache-from: ${{ steps.settings.outputs.cache_from }}
           cache-to: ${{ steps.settings.outputs.cache_to }}
 
