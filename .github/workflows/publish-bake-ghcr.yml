@@ -1,0 +1,123 @@
+name: Build and publish GHCR images with Bake
+
+on:
+  workflow_call:
+    inputs:
+      file:
+        description: Bake definition relative to the caller repository root
+        type: string
+        default: docker-bake.hcl
+      targets:
+        description: Bake targets or groups, one per line; empty selects the default group
+        type: string
+        default: ""
+      variables:
+        description: Non-secret Bake variables, one NAME=value per line
+        type: string
+        default: ""
+      scope:
+        description: Unique build configuration name for concurrency, such as an installation
+        type: string
+        required: true
+    secrets:
+      helper_webhook_url:
+        required: true
+      helper_webhook_secret:
+        required: true
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: publish-bake-${{ github.workflow }}-${{ github.ref }}-${{ inputs.scope }}
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    if: >-
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+      startsWith(github.ref, 'refs/heads/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Configure Bake
+        env:
+          BAKE_VARIABLES: ${{ inputs.variables }}
+          REF: ${{ github.ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          printf '%s\n' "$BAKE_VARIABLES" >> "$GITHUB_ENV"
+          cache_tag=buildcache
+          if [ "$REF" != "refs/heads/$DEFAULT_BRANCH" ]; then
+              ref_hash=$(printf '%s' "$REF" | sha256sum)
+              cache_tag="buildcache-branch-${ref_hash:0:16}"
+          fi
+          echo "CACHE_TAG=$cache_tag" >> "$GITHUB_ENV"
+
+      - name: Validate Helper Tool webhook secrets
+        env:
+          HELPER_WEBHOOK_URL: ${{ secrets.helper_webhook_url }}
+          HELPER_WEBHOOK_SECRET: ${{ secrets.helper_webhook_secret }}
+        run: test -n "$HELPER_WEBHOOK_URL" && test -n "$HELPER_WEBHOOK_SECRET"
+
+      - name: Generate publication metadata
+        id: metadata
+        uses: docker/metadata-action@v6
+        with:
+          tags: |
+            type=ref,event=branch
+            type=sha
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and publish images together
+        id: build
+        uses: docker/bake-action@v7
+        env:
+          APP_VERSION: ${{ github.sha }}
+          DOCKER_METADATA_OUTPUT_JSON: ${{ steps.metadata.outputs.json }}
+        with:
+          source: .
+          files: ${{ inputs.file }}
+          targets: ${{ inputs.targets }}
+          push: true
+
+      - name: Notify Helper Tool
+        env:
+          BUILD_METADATA: ${{ steps.build.outputs.metadata }}
+          DELIVERY_ID: ${{ github.run_id }}:${{ github.run_attempt }}:${{ inputs.scope }}
+          HELPER_WEBHOOK_URL: ${{ secrets.helper_webhook_url }}
+          HELPER_WEBHOOK_SECRET: ${{ secrets.helper_webhook_secret }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+
+          for target, result in json.loads(os.environ["BUILD_METADATA"]).items():
+              publications = {}
+              for reference in result["image.name"].split(","):
+                  image, tag = reference.rsplit(":", 1)
+                  publications.setdefault(image, []).append(tag)
+              for index, (image, tags) in enumerate(publications.items()):
+                  body = Path(os.environ["RUNNER_TEMP"]) / "publication.json"
+                  body.write_text(json.dumps({"image": image, "tags": tags}))
+                  subprocess.run([
+                      "curl", "--fail-with-body", "--silent", "--show-error",
+                      "--proto", "=https", "--connect-timeout", "10", "--max-time", "30",
+                      "--retry", "3", "--retry-delay", "5", "--retry-connrefused",
+                      "-H", "Authorization: Bearer " + os.environ["HELPER_WEBHOOK_SECRET"],
+                      "-H", "Content-Type: application/json",
+                      "-H", f"X-Webhook-Delivery: {os.environ['DELIVERY_ID']}:{target}:{index}",
+                      "--data-binary", "@" + str(body), os.environ["HELPER_WEBHOOK_URL"],
+                  ], check=True)
+          PY

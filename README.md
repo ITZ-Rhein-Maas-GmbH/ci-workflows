@@ -144,3 +144,83 @@ new inputs or secrets. For callers that reference `@main`, merge the
 Alternatively, pass a PAT or another valid credential as the optional
 `checkout_token` secret. When no checkout credential is supplied, the workflow
 uses the caller repository's `GITHUB_TOKEN`.
+
+## Publish several GHCR images with Bake
+
+`publish-bake-ghcr.yml` builds and publishes related images together. The caller
+owns the Bake definition, including image names, build arguments, tags, labels,
+and cache settings. The workflow runs only for branch pushes and manual branch
+runs. PR validation belongs to the caller. The single-image workflow above
+keeps its existing interface and PR publication behavior.
+
+```yaml
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    uses: ITZ-Rhein-Maas-GmbH/ci-workflows/.github/workflows/publish-bake-ghcr.yml@main
+    with:
+      scope: kubicz
+      variables: INSTALLATION=kubicz
+    secrets:
+      helper_webhook_url: ${{ secrets.HELPER_WEBHOOK_URL }}
+      helper_webhook_secret: ${{ secrets.HELPER_WEBHOOK_SECRET }}
+```
+
+Inputs:
+
+- `file`: Bake file relative to the repository root, default `docker-bake.hcl`.
+- `targets`: target or group names, one per line; empty selects Bake's default.
+- `variables`: non-secret Bake variables, one `NAME=value` per line.
+- `scope`: required name unique to each concurrent build configuration within
+  the caller workflow, such as the installation name.
+
+The workflow passes three environment variables to the caller's Bake file:
+
+- `APP_VERSION`: full caller commit SHA, for application release tracking.
+- `DOCKER_METADATA_OUTPUT_JSON`: Docker metadata-action output containing branch,
+  short `sha-…`, and default-branch `latest` tags, plus OCI labels.
+- `CACHE_TAG`: `buildcache` on the default branch or
+  `buildcache-branch-<first 16 SHA-256 hex characters of the full Git ref>`.
+
+For example, a Bake target can consume that metadata directly:
+
+```hcl
+variable "APP_VERSION" { default = "dev" }
+variable "DOCKER_METADATA_OUTPUT_JSON" { default = "{}" }
+variable "CACHE_TAG" { default = "" }
+
+target "app" {
+  args = { APP_VERSION = APP_VERSION }
+  tags = [for tag in lookup(jsondecode(DOCKER_METADATA_OUTPUT_JSON), "tags", [APP_VERSION]) :
+    "ghcr.io/example/product-app:${tag}"
+  ]
+  labels = lookup(jsondecode(DOCKER_METADATA_OUTPUT_JSON), "labels", {})
+  cache-from = CACHE_TAG == "" ? [] : [for tag in distinct([CACHE_TAG, "buildcache"]) : {
+    type = "registry"
+    ref  = "ghcr.io/example/product-app:${tag}"
+  }]
+  cache-to = CACHE_TAG == "" ? [] : [{
+    type = "registry"
+    ref  = "ghcr.io/example/product-app:${CACHE_TAG}"
+    mode = "max"
+  }]
+}
+```
+
+Replace `example` with the caller's GitHub owner. Use a distinct cache repository
+or tag for each target to avoid parallel cache writers replacing each other.
+Registry caching persists intermediate stages without a second GHA cache.
+Local builds leave `CACHE_TAG` empty and use their builder's local cache.
+
+The workflow checks out the caller, authenticates to GHCR, and invokes
+`docker/bake-action` directly with `push: true`. After all targets succeed,
+it reads the actual exported image names from the action's build metadata and
+sends one Helper Tool notification per image using the existing `{image, tags}`
+payload. Each notification has a distinct delivery ID. Image publication is
+not atomic; deploy matching revision tags after the complete job succeeds.
+
+Merge this shared workflow before switching callers that reference `@main`.
+It does not require the single-image workflow's proposed `build_args` input.
